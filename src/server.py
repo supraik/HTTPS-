@@ -1,63 +1,110 @@
-#!/usr/bin/env python3
 import socket
-import base64
-import os
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
+import threading
+import json
 
-HOST = "0.0.0.0"
-PORT = 8080
-
-# Predefined 16-byte key & IV (for AES-128-CBC)
-KEY = b"0123456789abcdef"
-IV = b"abcdef9876543210"
-
-def aes_encrypt(plaintext: bytes) -> str:
-    cipher = AES.new(KEY, AES.MODE_CBC, IV)
-    ciphertext = cipher.encrypt(pad(plaintext, AES.block_size))
-    return base64.b64encode(ciphertext).decode()
-
-def aes_decrypt(ciphertext_b64: str) -> bytes:
-    cipher = AES.new(KEY, AES.MODE_CBC, IV)
-    ciphertext = base64.b64decode(ciphertext_b64)
-    return unpad(cipher.decrypt(ciphertext), AES.block_size)
-
-def handle_request(request: str, secure: bool) -> bytes:
-    if request.startswith("GET /"):
-        body = "<html><body><h1>Simple Python HTTP Server!</h1></body></html>"
-        resp = f"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{body}"
-    elif request.startswith("POST /"):
-        body = request.split("\r\n\r\n", 1)[-1]
-        resp = f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nReceived POST: {body}"
-    else:
-        resp = "HTTP/1.1 404 Not Found\r\n\r\n"
-
-    if secure:
-        encrypted = aes_encrypt(resp.encode())
-        resp = f"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n{encrypted}"
-
-    return resp.encode()
-
-def start_server():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((HOST, PORT))
-        s.listen(5)
-        print(f"Server listening on {HOST}:{PORT}")
-
-        while True:
-            conn, addr = s.accept()
-            with conn:
-                print(f"Connection from {addr}")
-                data = conn.recv(4096)
-                if not data:
-                    continue
-
-                secure = os.path.exists("/tmp/secmode")
-                req = data.decode(errors="ignore")
-                response = handle_request(req, secure)
-                conn.sendall(response)
-                print(f"Secure Mode: {secure}")
+class ChatServer:
+    def __init__(self, host='127.0.0.1', port=5555):
+        self.host = host
+        self.port = port
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.clients = []
+        self.usernames = {}
+        
+    def broadcast(self, message, sender_socket=None):
+        """Send message to all connected clients except sender"""
+        for client in self.clients:
+            if client != sender_socket:
+                try:
+                    client.send(message)
+                except:
+                    self.remove_client(client)
+    
+    def handle_client(self, client_socket, address):
+        """Handle individual client connection"""
+        print(f"[NEW CONNECTION] {address} connected.")
+        
+        try:
+            # Receive username
+            username = client_socket.recv(1024).decode('utf-8')
+            self.usernames[client_socket] = username
+            
+            # Notify all clients about new user
+            join_msg = json.dumps({
+                'type': 'system',
+                'message': f'{username} joined the chat!'
+            }).encode('utf-8')
+            self.broadcast(join_msg, client_socket)
+            
+            # Send welcome message to new client
+            welcome_msg = json.dumps({
+                'type': 'system',
+                'message': 'Welcome to the chat! Encryption toggle is available in your client.'
+            }).encode('utf-8')
+            client_socket.send(welcome_msg)
+            
+            # Main message loop
+            while True:
+                message = client_socket.recv(4096)
+                if not message:
+                    break
+                
+                # Parse message to add username
+                try:
+                    msg_data = json.loads(message.decode('utf-8'))
+                    msg_data['username'] = username
+                    formatted_message = json.dumps(msg_data).encode('utf-8')
+                    self.broadcast(formatted_message, client_socket)
+                except json.JSONDecodeError:
+                    # If not JSON, treat as raw encrypted data
+                    self.broadcast(message, client_socket)
+                
+        except Exception as e:
+            print(f"[ERROR] {address}: {e}")
+        finally:
+            self.remove_client(client_socket)
+    
+    def remove_client(self, client_socket):
+        """Remove client and notify others"""
+        if client_socket in self.clients:
+            username = self.usernames.get(client_socket, "Unknown")
+            self.clients.remove(client_socket)
+            
+            if client_socket in self.usernames:
+                del self.usernames[client_socket]
+            
+            # Notify others
+            leave_msg = json.dumps({
+                'type': 'system',
+                'message': f'{username} left the chat.'
+            }).encode('utf-8')
+            self.broadcast(leave_msg)
+            
+            client_socket.close()
+            print(f"[DISCONNECTED] {username} disconnected.")
+    
+    def start(self):
+        """Start the server"""
+        self.server.bind((self.host, self.port))
+        self.server.listen()
+        print(f"[LISTENING] Server is listening on {self.host}:{self.port}")
+        print("[INFO] Waiting for connections...")
+        
+        try:
+            while True:
+                client_socket, address = self.server.accept()
+                self.clients.append(client_socket)
+                
+                thread = threading.Thread(
+                    target=self.handle_client,
+                    args=(client_socket, address)
+                )
+                thread.daemon = True
+                thread.start()
+                print(f"[ACTIVE CONNECTIONS] {len(self.clients)}")
+        except KeyboardInterrupt:
+            print("\n[SHUTDOWN] Server shutting down...")
+            self.server.close()
 
 if __name__ == "__main__":
-    start_server()
+    server = ChatServer()
+    server.start()
